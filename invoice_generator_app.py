@@ -91,9 +91,9 @@ with right:
                     st.session_state.entries = [x for x in st.session_state.entries if x['id'] != e['id']]
                     st.rerun()
             st.divider()
-        st.markdown(f"**Subtotal:** ${subtotal:,.2f}  
+        st.markdown(f"""**Subtotal:** ${subtotal:,.2f}  
 **Tax:** ${tax:,.2f}  
-**Total:** ${total:,.2f}")
+**Total:** ${total:,.2f}""")
     else:
         st.info('Add your first line item to see the invoice update instantly.')
     st.markdown('</div>', unsafe_allow_html=True)
