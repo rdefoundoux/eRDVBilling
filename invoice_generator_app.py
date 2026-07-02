@@ -1,8 +1,12 @@
 import streamlit as st
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from io import BytesIO
 from pathlib import Path
 import base64
+import json
+import sqlite3
+import os
+from typing import Optional
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
 from reportlab.lib.units import inch
@@ -37,6 +41,140 @@ def _logo_data_uri(data: bytes) -> str:
     # jpeg works for both jpg/png in most browsers via image/*; use image/jpeg as safe default
     return f"data:image/jpeg;base64,{b64}"
 
+
+# --------------------------------------------------------------------------------------
+# Database (SQLite) — persistent invoice history
+# --------------------------------------------------------------------------------------
+# NOTE: Streamlit Cloud's filesystem is ephemeral; the DB is wiped on redeploy or when
+# the container recycles. To keep data long-term either:
+#   * set st.secrets["DB_PATH"] to a path on a mounted persistent volume, or
+#   * use the sidebar Backup/Restore controls.
+try:
+    _cfg_path = st.secrets.get("DB_PATH", None)  # may raise if no secrets file
+except Exception:
+    _cfg_path = None
+DB_PATH = Path(_cfg_path or os.environ.get("DB_PATH", "/tmp/erdv_invoices.db"))
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _db_init() -> None:
+    with _db_connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS invoices (
+              id            INTEGER PRIMARY KEY AUTOINCREMENT,
+              invoice_no    TEXT UNIQUE NOT NULL,
+              company       TEXT,
+              company_addr  TEXT,
+              client        TEXT,
+              client_addr   TEXT,
+              invoice_date  TEXT,
+              due_date      TEXT,
+              tax_rate      REAL,
+              subtotal      REAL,
+              tax           REAL,
+              total         REAL,
+              notes         TEXT,
+              entries_json  TEXT,
+              logo_blob     BLOB,
+              created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
+              updated_at    TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.commit()
+
+
+_db_init()
+
+
+def db_save_invoice(payload: dict) -> int:
+    """Insert or update an invoice by invoice_no. Returns row id."""
+    with _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT id FROM invoices WHERE invoice_no = ?", (payload["invoice_no"],)
+        )
+        row = cur.fetchone()
+        now = datetime.utcnow().isoformat()
+        if row:
+            conn.execute(
+                """
+                UPDATE invoices SET
+                  company=?, company_addr=?, client=?, client_addr=?,
+                  invoice_date=?, due_date=?, tax_rate=?, subtotal=?, tax=?, total=?,
+                  notes=?, entries_json=?, logo_blob=?, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    payload["company"], payload["company_addr"], payload["client"], payload["client_addr"],
+                    payload["invoice_date"], payload["due_date"], payload["tax_rate"],
+                    payload["subtotal"], payload["tax"], payload["total"],
+                    payload["notes"], payload["entries_json"], payload["logo_blob"], now, row["id"],
+                ),
+            )
+            conn.commit()
+            return int(row["id"])
+        cur = conn.execute(
+            """
+            INSERT INTO invoices
+              (invoice_no, company, company_addr, client, client_addr, invoice_date, due_date,
+               tax_rate, subtotal, tax, total, notes, entries_json, logo_blob, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload["invoice_no"], payload["company"], payload["company_addr"],
+                payload["client"], payload["client_addr"], payload["invoice_date"], payload["due_date"],
+                payload["tax_rate"], payload["subtotal"], payload["tax"], payload["total"],
+                payload["notes"], payload["entries_json"], payload["logo_blob"], now, now,
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def db_list_invoices() -> list:
+    with _db_connect() as conn:
+        cur = conn.execute(
+            """
+            SELECT id, invoice_no, company, client, invoice_date, due_date,
+                   subtotal, tax, total, created_at, updated_at
+            FROM invoices
+            ORDER BY datetime(updated_at) DESC
+            """
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def db_get_invoice(invoice_id: int) -> Optional[dict]:
+    with _db_connect() as conn:
+        cur = conn.execute("SELECT * FROM invoices WHERE id = ?", (invoice_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+def db_delete_invoice(invoice_id: int) -> None:
+    with _db_connect() as conn:
+        conn.execute("DELETE FROM invoices WHERE id = ?", (invoice_id,))
+        conn.commit()
+
+
+def db_backup_bytes() -> bytes:
+    try:
+        return DB_PATH.read_bytes()
+    except Exception:
+        return b""
+
+
+def db_restore_from_bytes(data: bytes) -> None:
+    DB_PATH.write_bytes(data)
+    _db_init()
+
 # --------------------------------------------------------------------------------------
 # Session state
 # --------------------------------------------------------------------------------------
@@ -48,6 +186,38 @@ if "theme" not in st.session_state:
     st.session_state.theme = "light"
 if "logo" not in st.session_state:
     st.session_state.logo = DEFAULT_LOGO_BYTES
+if "loaded_from_id" not in st.session_state:
+    st.session_state.loaded_from_id = None
+if "prefill" not in st.session_state:
+    # Values loaded from DB history override defaults on next rerun
+    st.session_state.prefill = {}
+
+
+def _apply_loaded_invoice(row: dict) -> None:
+    """Load a saved invoice into session_state so the UI reflects it on next rerun."""
+    entries = json.loads(row.get("entries_json") or "[]")
+    max_id = 0
+    for e in entries:
+        try:
+            max_id = max(max_id, int(e.get("id") or 0))
+        except Exception:
+            pass
+    st.session_state.entries = entries
+    st.session_state.counter = max_id
+    st.session_state.loaded_from_id = int(row["id"])
+    st.session_state.prefill = {
+        "invoice_no": row.get("invoice_no") or "",
+        "company": row.get("company") or "",
+        "company_addr": row.get("company_addr") or "",
+        "client": row.get("client") or "",
+        "client_addr": row.get("client_addr") or "",
+        "invoice_date": row.get("invoice_date") or "",
+        "due_date": row.get("due_date") or "",
+        "notes": row.get("notes") or "",
+        "tax_rate": float(row.get("tax_rate") or 14.975),
+    }
+    if row.get("logo_blob"):
+        st.session_state.logo = bytes(row["logo_blob"])
 
 # --------------------------------------------------------------------------------------
 # Theme CSS (dark mode driven by a wrapper class we inject on every rerun)
@@ -247,11 +417,38 @@ with st.sidebar:
         st.rerun()
 
     st.markdown("### 💰 Tax")
-    tax_rate = st.number_input("Tax rate (%)", min_value=0.0, max_value=100.0, value=14.975, step=0.1)
+    _default_tax = float(st.session_state.prefill.get("tax_rate", 14.975))
+    tax_rate = st.number_input(
+        "Tax rate (%)", min_value=0.0, max_value=100.0, value=_default_tax, step=0.1
+    )
 
     st.markdown("### ⚡ Actions")
-    if st.button("Clear all line items", use_container_width=True):
+    if st.button("New invoice (clear form)", use_container_width=True):
         st.session_state.entries = []
+        st.session_state.counter = 0
+        st.session_state.loaded_from_id = None
+        st.session_state.prefill = {}
+        st.rerun()
+    if st.button("Clear line items only", use_container_width=True):
+        st.session_state.entries = []
+        st.rerun()
+
+    st.markdown("### 💾 Database")
+    st.caption(f"Storage: `{DB_PATH}`")
+    _all = db_list_invoices()
+    st.caption(f"{len(_all)} saved invoice(s)")
+    st.download_button(
+        "Backup DB (.sqlite)",
+        data=db_backup_bytes() or b"",
+        file_name="erdv_invoices.sqlite",
+        mime="application/octet-stream",
+        use_container_width=True,
+        disabled=(len(_all) == 0),
+    )
+    restore = st.file_uploader("Restore from backup", type=["sqlite", "db"])
+    if restore is not None:
+        db_restore_from_bytes(restore.read())
+        st.success("Database restored. Reloading…")
         st.rerun()
 
     st.caption("Modern layout · cleaner spacing · faster invoice workflow.")
@@ -309,28 +506,62 @@ st.write("")
 # --------------------------------------------------------------------------------------
 # Main tabs
 # --------------------------------------------------------------------------------------
-tab_details, tab_items, tab_preview = st.tabs(["📇 Company & Client", "➕ Line items", "👀 Preview & Export"])
+tab_details, tab_items, tab_preview, tab_history = st.tabs(
+    ["📇 Company & Client", "➕ Line items", "👀 Preview & Export", "📚 History"]
+)
+
+
+def _parse_date(s: str, fallback):
+    try:
+        if not s:
+            return fallback
+        return datetime.fromisoformat(s).date() if len(s) > 10 else datetime.strptime(s, "%Y-%m-%d").date()
+    except Exception:
+        return fallback
+
+
+pf = st.session_state.prefill
 
 with tab_details:
+    if st.session_state.loaded_from_id:
+        st.info(f"✏️ Editing saved invoice ID #{st.session_state.loaded_from_id}. Changes will update it in place when you save.")
     st.markdown('<div class="panel">', unsafe_allow_html=True)
     st.subheader("Invoice details")
     a, b = st.columns(2)
     with a:
-        company = st.text_input("Your company", "Groupe eRDV inc.")
-        company_addr = st.text_area("Company address", "Saint-Jean-sur-Richelieu, QC, Canada", height=80)
+        company = st.text_input("Your company", pf.get("company") or "Groupe eRDV inc.")
+        company_addr = st.text_area(
+            "Company address",
+            pf.get("company_addr") or "Saint-Jean-sur-Richelieu, QC, Canada",
+            height=80,
+        )
     with b:
-        client = st.text_input("Client name", "Soho Square Solutions")
-        client_addr = st.text_area("Client address", "", height=80, placeholder="Optional")
+        client = st.text_input("Client name", pf.get("client") or "Soho Square Solutions")
+        client_addr = st.text_area(
+            "Client address", pf.get("client_addr") or "", height=80, placeholder="Optional"
+        )
 
     c, d, e = st.columns(3)
     with c:
-        invoice_no = st.text_input("Invoice #", f'INV-{datetime.now().strftime("%Y%m%d")}-001')
+        invoice_no = st.text_input(
+            "Invoice #",
+            pf.get("invoice_no") or f'INV-{datetime.now().strftime("%Y%m%d")}-001',
+        )
     with d:
-        invoice_date = st.date_input("Invoice date", datetime.now())
+        invoice_date = st.date_input(
+            "Invoice date", _parse_date(pf.get("invoice_date", ""), datetime.now().date())
+        )
     with e:
-        due_date = st.date_input("Due date", datetime.now() + timedelta(days=15))
+        due_date = st.date_input(
+            "Due date",
+            _parse_date(pf.get("due_date", ""), (datetime.now() + timedelta(days=15)).date()),
+        )
 
-    notes = st.text_area("Notes / payment terms", "Payment due within 15 days. Thank you for your business.", height=80)
+    notes = st.text_area(
+        "Notes / payment terms",
+        pf.get("notes") or "Payment due within 15 days. Thank you for your business.",
+        height=80,
+    )
     st.markdown("</div>", unsafe_allow_html=True)
 
 with tab_items:
@@ -568,10 +799,90 @@ with tab_preview:
 
     st.write("")
     if st.session_state.entries:
-        st.download_button(
-            "⬇️  Download PDF invoice",
-            data=build_pdf(),
-            file_name=f"{invoice_no}.pdf",
-            mime="application/pdf",
-            use_container_width=True,
-        )
+        colA, colB = st.columns([1, 1])
+        with colA:
+            st.download_button(
+                "⬇️  Download PDF invoice",
+                data=build_pdf(),
+                file_name=f"{invoice_no}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
+        with colB:
+            if st.button("💾  Save invoice to history", use_container_width=True):
+                try:
+                    payload = {
+                        "invoice_no": invoice_no.strip(),
+                        "company": company,
+                        "company_addr": company_addr,
+                        "client": client,
+                        "client_addr": client_addr,
+                        "invoice_date": invoice_date.isoformat(),
+                        "due_date": due_date.isoformat(),
+                        "tax_rate": float(tax_rate),
+                        "subtotal": float(subtotal),
+                        "tax": float(tax),
+                        "total": float(total),
+                        "notes": notes,
+                        "entries_json": json.dumps(st.session_state.entries),
+                        "logo_blob": bytes(st.session_state.logo) if st.session_state.logo else None,
+                    }
+                    row_id = db_save_invoice(payload)
+                    st.session_state.loaded_from_id = row_id
+                    st.success(f"Saved invoice `{invoice_no}` to history (ID #{row_id}).")
+                except sqlite3.IntegrityError as ex:
+                    st.error(f"Could not save: {ex}")
+                except Exception as ex:
+                    st.error(f"Save failed: {ex}")
+
+
+# --------------------------------------------------------------------------------------
+# History tab
+# --------------------------------------------------------------------------------------
+with tab_history:
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.subheader("Saved invoices")
+    all_invoices = db_list_invoices()
+    if not all_invoices:
+        st.info("No saved invoices yet. Create one, then click “Save invoice to history” on the Preview tab.")
+    else:
+        # Filter row
+        q = st.text_input("Search (client, company, invoice #)", "")
+        def _match(inv):
+            if not q:
+                return True
+            ql = q.lower()
+            return any(
+                ql in (str(inv.get(k) or "").lower())
+                for k in ("invoice_no", "client", "company")
+            )
+        filtered = [i for i in all_invoices if _match(i)]
+        st.caption(f"Showing {len(filtered)} of {len(all_invoices)} invoice(s)")
+
+        for inv in filtered:
+            with st.container():
+                c1, c2, c3, c4, c5 = st.columns([2.2, 2, 1.4, 1.4, 1.4])
+                with c1:
+                    st.markdown(f"**{inv['invoice_no']}**")
+                    st.caption(inv.get("company") or "")
+                with c2:
+                    st.markdown(f"**{inv.get('client') or ''}**")
+                    st.caption(f"{inv.get('invoice_date') or ''} → due {inv.get('due_date') or ''}")
+                with c3:
+                    st.markdown("Total")
+                    st.markdown(f"**${(inv.get('total') or 0):,.2f}**")
+                with c4:
+                    if st.button("📂 Load", key=f"load{inv['id']}", use_container_width=True):
+                        row = db_get_invoice(int(inv["id"]))
+                        if row:
+                            _apply_loaded_invoice(row)
+                            st.success(f"Loaded `{row['invoice_no']}`. Switch to ‘Company & Client’ or ‘Preview’ to review.")
+                            st.rerun()
+                with c5:
+                    if st.button("🗑 Delete", key=f"del{inv['id']}", use_container_width=True):
+                        db_delete_invoice(int(inv["id"]))
+                        if st.session_state.loaded_from_id == int(inv["id"]):
+                            st.session_state.loaded_from_id = None
+                        st.rerun()
+                st.divider()
+    st.markdown("</div>", unsafe_allow_html=True)
