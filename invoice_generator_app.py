@@ -343,17 +343,44 @@ with tab_items:
             desc = st.text_input("Description", placeholder="e.g. Consulting — Senior Developer")
             f1, f2 = st.columns(2)
             with f1:
-                qty = st.number_input("Hours / quantity", min_value=0.0, value=8.0, step=0.5)
+                days = st.number_input(
+                    "Days worked",
+                    min_value=0.0, value=1.0, step=0.5,
+                    help="Half days supported (e.g. 0.5, 1.5, 2.5).",
+                )
             with f2:
-                rate = st.number_input("Rate ($)", min_value=0.0, value=80.0, step=5.0)
+                hours_per_day = st.number_input(
+                    "Hours per day",
+                    min_value=0.0, value=8.0, step=0.5,
+                    help="How many hours you worked in a full day.",
+                )
+            rate = st.number_input("Rate per hour ($)", min_value=0.0, value=80.0, step=5.0)
+
+            total_hours = days * hours_per_day
+            line_amount = total_hours * rate
+            st.markdown(
+                f'<div class="totals" style="margin-top:.4rem;">'
+                f'<div class="r"><span>Total hours</span><span><b>{total_hours:.2f}</b> h</span></div>'
+                f'<div class="r"><span>Line amount</span><span><b>${line_amount:,.2f}</b></span></div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
             submitted = st.form_submit_button("➕  Add line item", use_container_width=True)
             if submitted and desc.strip():
                 st.session_state.counter += 1
                 st.session_state.entries.append(
-                    {"id": st.session_state.counter, "desc": desc.strip(), "qty": qty, "rate": rate}
+                    {
+                        "id": st.session_state.counter,
+                        "desc": desc.strip(),
+                        "days": days,
+                        "hours_per_day": hours_per_day,
+                        "qty": total_hours,
+                        "rate": rate,
+                    }
                 )
                 st.rerun()
-        st.caption("Tip: press Enter to add quickly. Remove any row from the list on the right.")
+        st.caption("Tip: use 0.5 for a half day. Total hours = Days × Hours/day. Line amount = Total hours × Rate.")
         st.markdown("</div>", unsafe_allow_html=True)
 
     with right:
@@ -364,11 +391,20 @@ with tab_items:
         else:
             for e in st.session_state.entries:
                 amount = e["qty"] * e["rate"]
+                days_val = e.get("days")
+                hpd_val = e.get("hours_per_day")
+                if days_val is not None and hpd_val is not None:
+                    meta = (
+                        f"{days_val:g} day{'s' if days_val != 1 else ''} × {hpd_val:g} h/day "
+                        f"= {e['qty']:.2f} h × ${e['rate']:.2f}/h"
+                    )
+                else:
+                    meta = f"{e['qty']:.2f} × ${e['rate']:.2f}"
                 cols = st.columns([6, 2, 1])
                 with cols[0]:
                     st.markdown(
                         f'<div class="row"><div><div class="desc">{e["desc"]}</div>'
-                        f'<div class="meta">{e["qty"]:.2f} × ${e["rate"]:.2f}</div></div>'
+                        f'<div class="meta">{meta}</div></div>'
                         f'<div class="amt">${amount:,.2f}</div></div>',
                         unsafe_allow_html=True,
                     )
@@ -416,9 +452,18 @@ with tab_preview:
         st.divider()
         for e in st.session_state.entries:
             amount = e["qty"] * e["rate"]
+            days_val = e.get("days")
+            hpd_val = e.get("hours_per_day")
+            if days_val is not None and hpd_val is not None:
+                meta = (
+                    f"{days_val:g} day{'s' if days_val != 1 else ''} × {hpd_val:g} h/day "
+                    f"= {e['qty']:.2f} h × ${e['rate']:.2f}/h"
+                )
+            else:
+                meta = f"{e['qty']:.2f} × ${e['rate']:.2f}"
             st.markdown(
                 f'<div class="row"><div><div class="desc">{e["desc"]}</div>'
-                f'<div class="meta">{e["qty"]:.2f} × ${e["rate"]:.2f}</div></div>'
+                f'<div class="meta">{meta}</div></div>'
                 f'<div class="amt">${amount:,.2f}</div></div>',
                 unsafe_allow_html=True,
             )
@@ -471,17 +516,31 @@ with tab_preview:
             elements.append(Paragraph(client_addr.replace("\n", "<br/>"), body))
         elements.append(Spacer(1, 14))
 
-        data = [["Description", "Qty", "Rate", "Amount"]]
+        data = [["Description", "Days", "Hrs/day", "Total hrs", "Rate", "Amount"]]
         for e in st.session_state.entries:
+            days_val = e.get("days")
+            hpd_val = e.get("hours_per_day")
+            days_str = f"{days_val:g}" if days_val is not None else "-"
+            hpd_str = f"{hpd_val:g}" if hpd_val is not None else "-"
             data.append(
-                [e["desc"], f"{e['qty']:.2f}", f"${e['rate']:.2f}", f"${e['qty']*e['rate']:.2f}"]
+                [
+                    e["desc"],
+                    days_str,
+                    hpd_str,
+                    f"{e['qty']:.2f}",
+                    f"${e['rate']:.2f}",
+                    f"${e['qty']*e['rate']:.2f}",
+                ]
             )
         data += [
-            ["", "", "Subtotal", f"${subtotal:.2f}"],
-            ["", "", f"Tax ({tax_rate:g}%)", f"${tax:.2f}"],
-            ["", "", "Total", f"${total:.2f}"],
+            ["", "", "", "", "Subtotal", f"${subtotal:.2f}"],
+            ["", "", "", "", f"Tax ({tax_rate:g}%)", f"${tax:.2f}"],
+            ["", "", "", "", "Total", f"${total:.2f}"],
         ]
-        table = Table(data, colWidths=[3.25 * inch, 0.8 * inch, 1.0 * inch, 1.1 * inch])
+        table = Table(
+            data,
+            colWidths=[2.4 * inch, 0.55 * inch, 0.7 * inch, 0.75 * inch, 0.75 * inch, 1.0 * inch],
+        )
         table.setStyle(
             TableStyle(
                 [
@@ -490,7 +549,7 @@ with tab_preview:
                     ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                     ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#d7dee9")),
                     ("BACKGROUND", (0, 1), (-1, -4), colors.HexColor("#f8fbff")),
-                    ("FONTNAME", (2, -3), (-1, -1), "Helvetica-Bold"),
+                    ("FONTNAME", (4, -3), (-1, -1), "Helvetica-Bold"),
                     ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
                     ("TOPPADDING", (0, 0), (-1, -1), 8),
                     ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
